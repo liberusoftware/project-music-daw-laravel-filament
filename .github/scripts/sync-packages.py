@@ -249,6 +249,113 @@ def packagist(package, repository):
         raise RuntimeError(f'Packagist {endpoint} failed for {package}')
 
 
+SYNC_SOURCE = re.compile(r'(?m)^chore: sync \S+ from ([\w.-]+/[\w.-]+)@[0-9a-f]+'
+                         r'|^Sync liberusoftware/\S+ v\d+\.\d+\.\d+ from ([\w.-]+)')
+MANIFESTS = ('composer.json', 'module.json', 'theme.json')
+
+
+def blob(target, revision, name):
+    shown = subprocess.run(['git', 'show', f'{revision}:{name}'], cwd=target, capture_output=True)
+    if shown.returncode:
+        return None
+    if name in MANIFESTS:
+        try:
+            metadata = json.loads(shown.stdout)
+        except ValueError:
+            return shown.stdout
+        if isinstance(metadata, dict):
+            metadata.pop('version', None)
+        return json.dumps(metadata, sort_keys=True).encode()
+    return shown.stdout
+
+
+def sync_source(message):
+    match = SYNC_SOURCE.search(message)
+    if not match:
+        return None
+    return match[1] or f'{os.environ["GITHUB_REPOSITORY"].split("/")[0]}/{match[2]}'
+
+
+def is_this_source(name, known):
+    current = os.environ['GITHUB_REPOSITORY'].casefold()
+    if name.casefold() not in known:
+        # A renamed source repository still names its old location in earlier sync commits.
+        found = github(f'repos/{name}', missing_ok=True) or {}
+        known[name.casefold()] = str(found.get('full_name', '')).casefold() == current
+    return known[name.casefold()]
+
+
+def is_ancestor(target, commit, descendant):
+    return subprocess.run(['git', 'merge-base', '--is-ancestor', commit, descendant], cwd=target,
+                          capture_output=True).returncode == 0
+
+
+def recorded_sync(target, package):
+    try:
+        recorded = json.loads(Path('.github/package-releases.json').read_text()).get(package, {})
+    except (OSError, ValueError):
+        return None
+    reference = recorded.get('reference', '') if isinstance(recorded, dict) else ''
+    return reference if re.fullmatch(r'[0-9a-f]{40,64}', reference) and is_ancestor(target, reference, 'HEAD') else None
+
+
+def reconciled_files(destination, target):
+    """Accept only the exact upstream and replacement file contents reviewed together."""
+    receipts = Path('.github/package-reconciliations.json')
+    if not receipts.is_file():
+        return set()
+    reviewed = json.loads(receipts.read_text()).get(destination, {})
+    accepted = set()
+    for name, hashes in reviewed.items():
+        upstream = blob(target, 'HEAD', name)
+        replacement = blob(target, '', name)
+        if upstream is None or replacement is None:
+            continue
+        if [hashlib.sha256(content).hexdigest() for content in (upstream, replacement)] == hashes:
+            accepted.add(name)
+    return accepted
+
+
+def refuse_overwriting_independent_changes(target, destination, path, package):
+    """Three-way check: base is this source's last sync, theirs the destination head, ours the staged export."""
+    if subprocess.run(['git', 'rev-parse', '--verify', '--quiet', 'HEAD'], cwd=target,
+                      stdout=subprocess.DEVNULL).returncode:
+        return
+    known = {os.environ['GITHUB_REPOSITORY'].casefold(): True}
+    base = None
+    for entry in git('log', '--format=%H%x00%B%x1e', 'HEAD', cwd=target).split('\x1e'):
+        commit, _, message = entry.strip().partition('\0')
+        source = sync_source(message)
+        if source and is_this_source(source, known):
+            base = commit
+            break
+    recorded = recorded_sync(target, package)
+    if recorded and not (base and is_ancestor(target, recorded, base)):
+        base = recorded
+    since = base or git('hash-object', '-t', 'tree', '/dev/null', cwd=target)
+    theirs = set(filter(None, git('diff', '--name-only', '--no-renames', '-z', since, 'HEAD', cwd=target).split('\0')))
+    ours = set(filter(None, git('diff', '--cached', '--name-only', '--no-renames', '-z', 'HEAD', cwd=target).split('\0')))
+    conflicts = [name for name in sorted(theirs & ours)
+                 if blob(target, since, name) != blob(target, 'HEAD', name) != blob(target, '', name)]
+    if conflicts:
+        reconciled = reconciled_files(destination, target)
+        conflicts = [name for name in conflicts if name not in reconciled]
+    if not conflicts:
+        return
+    history = [since + '..HEAD'] if base else ['HEAD']
+    authors = set()
+    for entry in git('log', '--format=%B%x1e', *history, '--', *conflicts, cwd=target).split('\x1e'):
+        if entry.strip():
+            authors.add(sync_source(entry) or 'commits made directly in the package repository')
+    listed = ', '.join(conflicts[:20]) + (f' and {len(conflicts) - 20} more' if len(conflicts) > 20 else '')
+    origin = f'since its last sync from this repository ({base[:12]})' if base else 'and nothing was ever synced to it from this repository'
+    raise RuntimeError(
+        f'{destination} has changes {origin} that this sync would overwrite: {listed}. '
+        f'They come from {", ".join(sorted(authors))}. '
+        f'Reconcile them first: bring them into {path} here, or have them reverted in {destination}, then rerun. '
+        'No source is treated as authoritative. Nothing was pushed, tagged or released.')
+
+
 def publish(path, head, before):
     name = repository_name(path)
     destination = f'liberusoftware/{name}'
@@ -328,6 +435,7 @@ def publish(path, head, before):
                         manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + '\n')
         write_metadata()
         git('add', '-A', cwd=target)
+        refuse_overwriting_independent_changes(target, destination, path, package)
         changed = subprocess.run(['git', 'diff', '--cached', '--quiet'], cwd=target).returncode != 0
         tags = git('tag', '--list', cwd=target).splitlines()
         declared_version = version(declared)
@@ -337,6 +445,14 @@ def publish(path, head, before):
             (declared_version[0] == 0 and declared_version[1] != previous_version[1]))
         explicit_bump = declared_version and (incompatible or declared_version > (previous_version or (0, 0, 0)))
         if changed or not has_head or explicit_bump:
+            if has_head:
+                # A partial workflow can publish this package before another package fails.
+                # Use that package's exported commit when calculating its next release.
+                marker = f'chore: sync {path} from {os.environ["GITHUB_REPOSITORY"]}@'
+                previous_message = git('log', '-1', '--format=%B', cwd=target)
+                previous_sync = re.match(re.escape(marker) + r'([0-9a-f]{40,64})\n', previous_message)
+                if previous_sync and is_ancestor(Path.cwd(), previous_sync[1], head):
+                    before = previous_sync[1]
             history = [f'{before}..{head}'] if before and set(before) != {'0'} else [head]
             messages = git('log', '--format=%B', *history, '--', path)
             # Project-wide breaking releases do not change every library's public API.
